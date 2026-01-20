@@ -1,7 +1,7 @@
 from google import genai
 import os
 
-client = genai.Client(api_key='AIzaSyBG3BQgy5tLCym-3HQey1zPrqXF4pef1I0')
+client = genai.Client(api_key= os.getenv("gemini"))
 
 # List BASE models available to your key
 for m in client.models.list(config={"query_base": True}):
