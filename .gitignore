@@ -7,3 +7,4 @@ __pycache__/
 hackathon/
 test_binary/
 extractor/
+.env    

@@ -1,3 +1,122 @@
+# import sys
+# import os
+# import subprocess
+# from qdrant_client import QdrantClient
+# from transformers import AutoTokenizer, AutoModel
+# import torch
+
+# # --- CONFIGURATION ---
+# EXTRACTOR = "./extractor"
+# COLLECTION = "binary_dna_pro"
+# THRESHOLD = 0.85  # 85% Similarity required to trigger an alert
+
+# # --- SETUP ---
+# print("1. Loading CodeBERT Scanner...")
+# tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+# model = AutoModel.from_pretrained("microsoft/codebert-base")
+
+# client = QdrantClient(host="localhost", port=6333)
+
+# # --- HELPER FUNCTIONS (Reused from Ingest) ---
+# def get_function_map(file_path):
+#     """Finds functions in the binary using nm"""
+#     cmd = ["nm", "-n", file_path] 
+#     result = subprocess.run(cmd, capture_output=True, text=True)
+#     symbols = []
+#     for line in result.stdout.splitlines():
+#         parts = line.split()
+#         if len(parts) >= 3:
+#             try:
+#                 addr = int(parts[0], 16)
+#                 name = parts[-1]
+#                 symbols.append({"addr": addr, "name": name})
+#             except: continue
+
+#     functions = []
+#     for i in range(len(symbols) - 1):
+#         curr = symbols[i]
+#         next_sym = symbols[i+1]
+#         size = next_sym["addr"] - curr["addr"]
+#         if size > 0:
+#             functions.append({"start": hex(curr["addr"]), "size": str(size), "name": curr["name"]})
+#     return functions
+
+# def embed_code(text):
+#     """Convert Assembly to Vector"""
+#     inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+#     with torch.no_grad():
+#         outputs = model(**inputs)
+#     return outputs.pooler_output[0].tolist()
+
+# # --- MAIN SCANNING LOGIC ---
+# def scan_file(file_path):
+#     print(f"\n--- SCANNING: {os.path.basename(file_path)} ---")
+    
+#     # 1. Break file into functions
+#     funcs = get_function_map(file_path)
+#     if not funcs:
+#         print("[!] No functions found. Is this a compiled .o file?")
+#         return
+
+#     vulnerabilities_found = 0
+
+#     for func in funcs:
+#         # Skip internal system functions
+#         if func['name'].startswith("_") and "bad" not in func['name']: 
+#             continue
+
+#         # 2. Extract Assembly
+#         cmd = [EXTRACTOR, file_path, func['start'], func['size']]
+#         res = subprocess.run(cmd, capture_output=True, text=True)
+#         assembly = res.stdout.strip()
+        
+#         if len(assembly) < 10: continue
+
+#         # 3. Vectorize
+#         vector = embed_code(assembly)
+
+#         # 4. Ask Qdrant (UPDATED COMMAND FOR NEW VERSION)
+#         # We use query_points() instead of search()
+#         results = client.query_points(
+#             collection_name=COLLECTION,
+#             query=vector, # New API uses 'query', not 'query_vector'
+#             limit=1
+#         ).points
+
+#         if not results: continue
+
+#         match = results[0]
+#         score = match.score
+#         match_type = match.payload['type']
+#         match_name = match.payload['function']
+
+#         # 5. The Verdict
+#         if score > THRESHOLD:
+#             if match_type == "VULNERABLE":
+#                 print(f"\n[!!!] VULNERABILITY DETECTED [!!!]")
+#                 print(f"   Function: {func['name']}")
+#                 print(f"   Matches:  {match_name}")
+#                 print(f"   Confidence: {score*100:.2f}%")
+#                 print(f"   Signature: {match.payload['filename']}")
+#                 vulnerabilities_found += 1
+#             else:
+#                 print(f"   [OK] {func['name']} looks safe (Matches {match_name} @ {score*100:.1f}%)")
+#         else:
+#             print(f"   [?] {func['name']} is Unknown (Low similarity)")
+
+#     print("-" * 30)
+#     if vulnerabilities_found > 0:
+#         print(f"RESULT: ❌ FILE IS DANGEROUS ({vulnerabilities_found} threats detected)")
+#     else:
+#         print("RESULT: ✅ FILE APPEARS SAFE")
+
+# if __name__ == "__main__":
+#     if len(sys.argv) < 2:
+#         print("Usage: python3 scan.py <path_to_binary.o>")
+#     else:
+#         scan_file(sys.argv[1])
+
+
 import sys
 import os
 import subprocess
@@ -8,107 +127,123 @@ import torch
 # --- CONFIGURATION ---
 EXTRACTOR = "./extractor"
 COLLECTION = "binary_dna_pro"
-THRESHOLD = 0.85  # 85% Similarity required to trigger an alert
+THRESHOLD = 0.85 
 
 # --- SETUP ---
-print("1. Loading CodeBERT Scanner...")
+os.environ["TOKENIZERS_PARALLELISM"] = "false" # Silence warnings
+
+print("1. Loading Scanner...")
 tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
 model = AutoModel.from_pretrained("microsoft/codebert-base")
-
 client = QdrantClient(host="localhost", port=6333)
 
-# --- HELPER FUNCTIONS (Reused from Ingest) ---
+# --- FUNCTIONS ---
 def get_function_map(file_path):
-    """Finds functions in the binary using nm"""
+    file_size = os.path.getsize(file_path)
     cmd = ["nm", "-n", file_path] 
     result = subprocess.run(cmd, capture_output=True, text=True)
+    
     symbols = []
     for line in result.stdout.splitlines():
         parts = line.split()
         if len(parts) >= 3:
             try:
                 addr = int(parts[0], 16)
+                symbol_type = parts[1].lower() # Get the type (T, D, B, etc.)
                 name = parts[-1]
+                
+                # FIX: Only accept 't' (Text section = Code). Ignore Data.
+                if symbol_type != 't': continue 
+                
+                if name.startswith("ltmp") or name.startswith("l_.") or name.startswith("L_."): continue
                 symbols.append({"addr": addr, "name": name})
             except: continue
 
     functions = []
-    for i in range(len(symbols) - 1):
+    for i in range(len(symbols)):
         curr = symbols[i]
-        next_sym = symbols[i+1]
-        size = next_sym["addr"] - curr["addr"]
+        if i < len(symbols) - 1:
+            size = symbols[i+1]["addr"] - curr["addr"]
+        else:
+            size = file_size - curr["addr"]
         if size > 0:
             functions.append({"start": hex(curr["addr"]), "size": str(size), "name": curr["name"]})
     return functions
 
 def embed_code(text):
-    """Convert Assembly to Vector"""
     inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
     with torch.no_grad():
         outputs = model(**inputs)
     return outputs.pooler_output[0].tolist()
 
-# --- MAIN SCANNING LOGIC ---
+# --- MAIN SCANNER ---
 def scan_file(file_path):
-    print(f"\n--- SCANNING: {os.path.basename(file_path)} ---")
+    filename = os.path.basename(file_path)
+    print(f"\nScanning Target: {filename}")
+    print("=" * 65)
+    print(f"{'FUNCTION NAME':<40} | {'STATUS':<12} | {'CONFIDENCE'}")
+    print("-" * 65)
     
-    # 1. Break file into functions
     funcs = get_function_map(file_path)
     if not funcs:
-        print("[!] No functions found. Is this a compiled .o file?")
+        print("[!] No functions found.")
         return
 
-    vulnerabilities_found = 0
+    threats = 0
 
     for func in funcs:
-        # Skip internal system functions
-        if func['name'].startswith("_") and "bad" not in func['name']: 
-            continue
+        # Skip Mac system functions (start with ___) but keep standard ones
+        if func['name'].startswith("___"): continue 
 
-        # 2. Extract Assembly
+        # Extract
         cmd = [EXTRACTOR, file_path, func['start'], func['size']]
         res = subprocess.run(cmd, capture_output=True, text=True)
         assembly = res.stdout.strip()
         
         if len(assembly) < 10: continue
 
-        # 3. Vectorize
+        # Vectorize
         vector = embed_code(assembly)
 
-        # 4. Ask Qdrant (UPDATED COMMAND FOR NEW VERSION)
-        # We use query_points() instead of search()
-        results = client.query_points(
-            collection_name=COLLECTION,
-            query=vector, # New API uses 'query', not 'query_vector'
-            limit=1
-        ).points
+        # --- FIX: USE NEW API (query_points) ---
+        try:
+            results = client.query_points(
+                collection_name=COLLECTION,
+                query=vector,
+                limit=1
+            ).points
+        except AttributeError:
+            # Fallback for older clients just in case
+            results = client.search(
+                collection_name=COLLECTION,
+                query_vector=vector,
+                limit=1
+            )
 
-        if not results: continue
+        if not results: 
+            print(f"{func['name'][:40]:<40} | Unknown      | N/A")
+            continue
 
         match = results[0]
         score = match.score
-        match_type = match.payload['type']
-        match_name = match.payload['function']
+        match_type = match.payload.get('type', 'UNKNOWN') # Safe access
 
-        # 5. The Verdict
         if score > THRESHOLD:
             if match_type == "VULNERABLE":
-                print(f"\n[!!!] VULNERABILITY DETECTED [!!!]")
-                print(f"   Function: {func['name']}")
-                print(f"   Matches:  {match_name}")
-                print(f"   Confidence: {score*100:.2f}%")
-                print(f"   Signature: {match.payload['filename']}")
-                vulnerabilities_found += 1
+                status = "\033[91mVULNERABLE\033[0m" # Red
+                threats += 1
             else:
-                print(f"   [OK] {func['name']} looks safe (Matches {match_name} @ {score*100:.1f}%)")
+                status = "\033[92mSAFE\033[0m"       # Green
+            
+            print(f"{func['name'][:40]:<40} | {status:<12} | {score*100:.1f}%")
         else:
-            print(f"   [?] {func['name']} is Unknown (Low similarity)")
+            print(f"{func['name'][:40]:<40} | Unknown      | {score*100:.1f}%")
 
-    print("-" * 30)
-    if vulnerabilities_found > 0:
-        print(f"RESULT: ❌ FILE IS DANGEROUS ({vulnerabilities_found} threats detected)")
+    print("-" * 65)
+    if threats > 0:
+        print(f"\033[91m[!] CRITICAL: {threats} Supply Chain Vulnerabilities Detected!\033[0m")
     else:
-        print("RESULT: ✅ FILE APPEARS SAFE")
+        print(f"\033[92m[OK] Code appears safe.\033[0m")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
