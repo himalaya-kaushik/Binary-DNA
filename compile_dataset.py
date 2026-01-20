@@ -1,9 +1,9 @@
 import os
 import subprocess
 
-SOURCE_DIR = "./data/source" 
-OUTPUT_DIR = "./data/binaries"
-OS_TYPE = "linux" # or "windows"
+SOURCE_DIR = "./data/test_source" 
+OUTPUT_DIR = "./data/test_binaries"
+OS_TYPE = "linux" 
 
 def compile_files():
     if not os.path.exists(OUTPUT_DIR):
